@@ -25,7 +25,7 @@ CYAN=$'\033[0;96m'
 BOLD=$'\033[1m'
 PLAIN=$'\033[0m'
 
-sh_ver="2.1.0"
+sh_ver="2.2.0"
 REPO_URL="https://github.com/pomelo-neko/warp-google"
 ENGINE=/usr/local/bin/warp-google
 WRAPPER=/usr/local/bin/warp
@@ -137,7 +137,7 @@ write_engine() {
     cat > "$ENGINE" <<'WARP_ENGINE_EOF'
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════════════════
-#  warp-google 运行时引擎   v2.1.0
+#  warp-google 运行时引擎   v2.2.0
 #  配置: /etc/warp-google/config      日志: /var/log/warp-google.log
 #  用法: warp-google {start|stop|restart|status|probe|ip|scan|region|...}
 # ══════════════════════════════════════════════════════════════════════
@@ -1031,6 +1031,14 @@ cmd_watchdog() {
         log "watchdog: 出口漂移 $cc != $PREFER_REGION (colo=$colo)"
         [ "$AUTO_REPIN" = "1" ] && repin_region "$PREFER_REGION"
     fi
+
+    # 送中复查：Google 的判定会随时间变化（邻居持续上报会把整段拖下水），
+    # 一旦翻红就记日志提醒重新 hunt
+    local cns
+    cns=$(google_cn_state "-x socks5://127.0.0.1:$WARP_PROXY_PORT" | cut -d'|' -f1)
+    if [ "$cns" = "cn" ]; then
+        log "watchdog: 出口 $ip ($cc/$colo) 已被 Google 判定为中国大陆 —— 执行 warp hunt 换一个"
+    fi
     return 0
 }
 
@@ -1129,6 +1137,142 @@ cmd_leak() {
     printf '%s\n' "═════════════════════════════════════════"
 }
 
+# ── 找一个「不送中」的 WARP 出口并锁定 ───────────────────────────────
+# 邻居污染只能换出口。WARP 出口也是共享池，所以必须逐个接入点实测
+# 「出口 IP 在 Google 眼里是不是中国大陆」，找到干净的那个再钉住。
+cmd_hunt() {
+    local want="" deep=0 rounds=1
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --region) want=$2; shift 2 ;;
+            --deep)   deep=1; shift ;;
+            --rounds) rounds=$2; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    command -v warp-cli >/dev/null 2>&1 || die "warp-cli 未安装"
+
+    local bases ports
+    if [ "$deep" = "1" ]; then
+        bases="$DEEP_BASE"; ports="2408 500 1701 4500"
+    else
+        bases="$DEFAULT_BASE"; ports="$SCAN_PORTS"
+    fi
+
+    local b p ep list=""
+    for b in $bases; do for p in $ports; do list="$list $b:$p"; done; done
+    [ -n "$SCAN_EXTRA" ] && list="$list $SCAN_EXTRA"
+
+    local total=0
+    for ep in $list; do total=$((total + 1)); done
+
+    printf '%s\n' "════════ 寻找不送中的 WARP 出口 ════════"
+    printf '  接入点候选 : %s 个 × %s 轮\n' "$total" "$rounds"
+    printf '  目标地区   : %s\n' "${want:-不限}"
+    printf '\n'
+    warn "过程中会反复断开重连 WARP，网页 Google 会短暂走直连，属正常"
+
+    local saved_ep="$ENDPOINT" hunt_done=0
+    hunt_restore() {
+        [ "$hunt_done" = "1" ] && return 0
+        hunt_done=1
+        printf '\n'
+        info "恢复原接入点设置..."
+        if [ -n "$saved_ep" ]; then endpoint_set "$saved_ep" >/dev/null 2>&1
+        else endpoint_reset >/dev/null 2>&1; fi
+        wcli disconnect; sleep 1; wcli connect
+        local rst
+        rst=$(wait_connected "$CONNECT_TIMEOUT")
+        warn "未找到可用出口，已恢复原设置（状态: $rst）"
+    }
+    trap 'hunt_restore; trap - INT TERM; exit 130' INT TERM
+
+    clear_iptables
+    clear_quic_block
+
+    : > "$CONF_DIR/hunt.tsv"
+    local r st tr gip cc colo cn cnst found=0
+    for r in $(seq 1 "$rounds"); do
+        [ "$rounds" -gt 1 ] && printf '%s\n' "── 第 $r 轮 ──"
+        for ep in $list; do
+            printf '  → %-22s' "$ep"
+            if ! endpoint_set "$ep" >/dev/null 2>&1; then
+                printf ' 无法设置接入点，终止\n'
+                hunt_restore; trap - INT TERM; return 1
+            fi
+            wcli disconnect
+            sleep 1
+            wcli connect
+            st=$(wait_connected "$CONNECT_TIMEOUT")
+            if [ "$st" != "connected" ]; then
+                printf ' × 连不上 (%s)\n' "$st"
+                printf '%s\t-\t%s\t-\t%s\n' "$ep" "FAIL" "$st" >> "$CONF_DIR/hunt.tsv"
+                continue
+            fi
+            sleep 2
+            tr=$(probe_trace 4)
+            if [ -z "$tr" ]; then
+                printf ' ! 拿不到出口信息\n'
+                printf '%s\t-\tNO-TRACE\t-\t-\n' "$ep" >> "$CONF_DIR/hunt.tsv"
+                continue
+            fi
+            gip=$(printf '%s' "$tr" | cut -d'|' -f1)
+            cc=$(printf '%s' "$tr" | cut -d'|' -f2)
+            colo=$(printf '%s' "$tr" | cut -d'|' -f3)
+            cn=$(google_cn_state "-x socks5://127.0.0.1:$WARP_PROXY_PORT")
+            cnst=$(printf '%s' "$cn" | cut -d'|' -f1)
+            printf ' %-4s %-5s %-15s %s\n' "$cc" "$colo" "$gip" "$(printf '%s' "$cn" | cut -d'|' -f2)"
+            printf '%s\t%s\t%s\t%s\t%s\n' "$ep" "$gip" "$cc" "$cnst" "$colo" >> "$CONF_DIR/hunt.tsv"
+
+            if [ "$cnst" != "cn" ] && [ "$cnst" != "unreachable" ]; then
+                if [ -z "$want" ] || [ "$cc" = "$want" ]; then
+                    found=1
+                    break
+                fi
+            fi
+        done
+        [ "$found" = "1" ] && break
+    done
+
+    printf '\n%s\n' "════════ 结果 ════════"
+    awk -F'\t' '{printf "  %-22s %-16s %-4s %-6s %s\n",$1,$2,$3,$5,$4}' "$CONF_DIR/hunt.tsv" | head -40
+
+    if [ "$found" = "1" ]; then
+        hunt_done=1
+        cfg_set ENDPOINT "$ep"
+        [ -n "$want" ] && cfg_set PREFER_REGION "$want"
+        printf '\n'
+        ok "找到不送中的出口: $ep （出口 IP $gip, 地区 $cc, colo $colo）"
+        do_start >/dev/null 2>&1
+        ok "已锁定该接入点并重新装好劫持规则"
+        printf '\n'
+        show_exit
+        printf '\n'
+        warn "Google 的判定会随时间变化，建议定期复查: warp leak"
+        trap - INT TERM
+        return 0
+    fi
+
+    # 区分两种失败：真的全送中，还是有不送中的但地区不匹配
+    local clean_regions
+    clean_regions=$(awk -F'\t' '$4!="cn" && $4!="unreachable" && $4!="FAIL" && $4!="NO-TRACE" && $3!="-" {print $3}' \
+        "$CONF_DIR/hunt.tsv" 2>/dev/null | sort -u | tr '\n' ' ')
+    hunt_restore
+    trap - INT TERM
+    printf '\n'
+    if [ -n "$clean_regions" ]; then
+        warn "没有找到地区为 $want 的出口，但下面这些地区的出口是不送中的: $clean_regions"
+        warn "换个目标地区再试: warp hunt --region <上面某个地区>"
+    else
+        warn "试遍了也没有一个不送中的 WARP 出口。"
+        warn "说明 Cloudflare WARP 这批出口在 Google 眼里同样是中国区 —— 免费方案到头了："
+        warn "  要么换目标地区的小鸡做落地，要么用静态住宅 IP。"
+        warn "别再来回换接入点了，换不出来的。"
+    fi
+    return 1
+}
+
 # ── 一键恢复到已知可用状态 ───────────────────────────────────────────
 cmd_recover() {
     info "恢复中：重置接入点 → 重连 → 刷新规则"
@@ -1221,6 +1365,7 @@ case "$1" in
     recover)        cmd_recover ;;
     doctor)         cmd_doctor ;;
     leak|cn)        cmd_leak ;;
+    hunt)           shift; cmd_hunt "$@" ;;
     start)          do_start ;;
     stop)           do_stop ;;
     restart)        do_stop; sleep 1; do_start ;;
@@ -1235,7 +1380,7 @@ case "$1" in
     watchdog)       cmd_watchdog ;;
     *)
         cat <<'USAGE_EOF'
-warp-google —— WARP Google 透明代理运行时 (v2.1.0)
+warp-google —— WARP Google 透明代理运行时 (v2.2.0)
 
   start / stop / restart          启停透明代理
   status                          完整状态 + 当前出口 IP / 地区
@@ -1248,6 +1393,8 @@ warp-google —— WARP Google 透明代理运行时 (v2.1.0)
                                   手动指定 / 清除接入点
   ipv4   [on|off]                 强制 IPv4 开关
   refresh-google                  从官方 goog.json 刷新 Google 网段
+  hunt [--region CC] [--deep] [--rounds N]
+                                  逐个接入点实测出口是否送中，找到干净的就锁定
   leak                            送中 / 泄漏检测：Google 到底有没有走 WARP
   recover                         一键恢复（重置接入点 + 重连 + 刷新规则）
   doctor                          逐层体检，定位到底卡在哪一层
@@ -1528,7 +1675,7 @@ INSTALLER=/usr/local/bin/warp-google.sh
 RAW_URL="https://raw.githubusercontent.com/pomelo-neko/warp-google/main/warp-google.sh"
 
 case "$1" in
-    status|start|stop|restart|probe|scan|region|nat64|endpoint|ipv4|watchdog|refresh-google|recover|doctor|leak)
+    status|start|stop|restart|probe|scan|region|nat64|endpoint|ipv4|watchdog|refresh-google|recover|doctor|leak|hunt)
         [ -x "$ENGINE" ] || { echo "warp-google 未安装，请先执行安装脚本"; exit 1; }
         exec "$ENGINE" "$@"
         ;;
@@ -1567,6 +1714,11 @@ case "$1" in
     warp test                    测试直连 / WARP / 出口信息
     warp ip                      只看出口 IP 与地区
     warp restart                 重启透明代理与规则
+
+  出口被送中（邻居污染）时
+    warp hunt                    逐个接入点实测，找到「不送中」的出口并锁定
+    warp hunt --region JP        同上，但只接受日本出口
+    warp hunt --deep --rounds 2  试得更狠（更多接入点 × 多轮）
 
   地区 / 接入点
     warp scan [--deep]           扫描所有接入点，列出各自落地的地区
@@ -1844,7 +1996,7 @@ show_menu() {
     printf '  %s8.%s  重启透明代理\n' "$GREEN" "$PLAIN"
     printf '\n'
     printf '  %s9.%s  一键恢复（Google 打不开时先选这个） %s←%s\n' "$GREEN" "$PLAIN" "$YELLOW" "$PLAIN"
-    printf '  %s10.%s Google 送中 / 泄漏检测（看 Google 到底走没走 WARP）\n' "$GREEN" "$PLAIN"
+    printf '  %s10.%s 找不送中的出口并锁定（邻居污染用这个） %s←%s\n' "$GREEN" "$PLAIN" "$YELLOW" "$PLAIN"
     printf '  %s11.%s 逐层体检诊断\n' "$GREEN" "$PLAIN"
     printf '  %s12.%s 完整卸载\n' "$GREEN" "$PLAIN"
     printf '\n'
@@ -1885,7 +2037,7 @@ show_menu() {
         7) [ -x "$ENGINE" ] && "$ENGINE" refresh-google && "$ENGINE" restart ;;
         8) [ -x "$ENGINE" ] && "$ENGINE" restart ;;
         9) if [ -x "$ENGINE" ]; then "$ENGINE" recover; else warn "请先安装"; fi ;;
-        10) if [ -x "$ENGINE" ]; then "$ENGINE" leak; else warn "请先安装"; fi ;;
+        10) if [ -x "$ENGINE" ]; then "$ENGINE" hunt; else warn "请先安装"; fi ;;
         11) if [ -x "$ENGINE" ]; then "$ENGINE" doctor; else warn "请先安装"; fi ;;
         12)
             read -rp "  确认完整卸载? [y/N]: " cu
@@ -1909,7 +2061,7 @@ case "$1" in
     status)    show_status ;;
     test)      do_test ;;
     menu|"")   show_menu ;;
-    ip|probe|start|stop|restart|scan|region|nat64|endpoint|ipv4|watchdog|refresh-google|recover|doctor|leak)
+    ip|probe|start|stop|restart|scan|region|nat64|endpoint|ipv4|watchdog|refresh-google|recover|doctor|leak|hunt)
         if [ -x "$ENGINE" ]; then
             exec "$ENGINE" "$@"
         fi
