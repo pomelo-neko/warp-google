@@ -9,16 +9,41 @@
 
 ## 零、出问题了先看这里（v2.0.1）
 
-### Google 打不开了
+### Google 打不开了 / 怎么改都没用
 
-按顺序执行，一般就好了：
+按顺序执行：
 
 ```bash
-warp doctor     # 逐层体检：组件 / 连接 / SOCKS5 / 规则 / 结论
-warp recover    # 一键恢复：重置接入点 → 重连 → 刷新规则
+warp leak       # ① 最关键：Google 到底有没有走 WARP？是哪个环节在漏？
+warp doctor     # ② 逐层体检：组件 / 连接 / SOCKS5 / 规则 / 结论
+warp recover    # ③ 一键恢复：重置接入点 → 重连 → 刷新规则
 ```
 
-最省事的做法是先 `warp recover`；如果还不行，把 `warp doctor` 的输出发出来，它会告诉你卡在哪一层。
+`warp leak` 会做三件事，直接回答「为什么改什么都没用」：
+
+1. **临时绕过劫持**访问 google.com，看**直连**时 Google 把你判成哪个地区
+2. **经 WARP** 访问 google.com，看 WARP 出口被 Google 判成哪个地区（送中会 302 到 `google.cn` / `google.com.hk`）
+3. **清空 iptables 计数器 → 发两个 Google 请求 → 看劫持规则有没有被命中**。这一步是决定性的：如果命中 0 个包，说明 **Google 流量根本没走 WARP**，Google 看到的是你 VPS 自己的 IP —— 那你换接入点、换地区当然全是白费力气。
+
+### 如果 `warp leak` 显示「WARP 出口本身被送中」
+
+那就**不是配置问题了**，别再调参数了。
+
+Cloudflare WARP 的出口 IP 是**共享池**，全世界大量用户在共用同一批网段，Google 对这些段的判定会随用量和时间变化。这种情况换接入点、换地区、换协议**全都没用** —— 因为出口段是同一个池子。
+
+**这时候只剩这几条路**（按性价比排序）：
+
+| 方案 | 成本 | 说明 |
+|---|---|---|
+| **目标地区的小鸡做落地** | 几元/月 | 最稳。买一台日本/新加坡/美国的便宜小鸡，对它做二级转发。IP 独享、可控、随时能换 |
+| **住宅 / 原生 IP 代理** | 按流量 | 最干净。很多商家直接标 Google 可用性 |
+| **换 VPS 商家（不是只换 IP）** | 换机器 | 同一商家换 IP 通常还在同一个段里 —— 你已经验证过没用了；换商家换段才有意义 |
+| **Cloudflare Zero Trust (Teams)** | 免费额度 | 能固定 Gateway 位置，理论上影响出口选择；实际效果取决于网络路径，值得一试 |
+| **继续赌 WARP** | 0 | 等 Cloudflare 换段或 Google 改判定。不可控，只能靠 `warp scan` 碰运气 |
+
+> 说句实在话：**WARP 从来不是为「稳定解锁某地区服务」设计的** —— 它的出口是共享的、随机的、容易被滥用标记的。如果你的目标就是稳定用上 AI Studio，花几块钱买台目标地区的小鸡做落地，比在这里继续调参数省心得多。
+>
+> 这个脚本能保证的是：把 Google 流量**确定性地**送进 WARP（`warp leak` 的 [3] 来验证），并且明确告诉你 Google 究竟看到了什么 —— 让你能快速判断"该换方案了"，而不是盲猜。
 
 ### 扫描显示「所有接入点都不可用」是怎么回事
 
@@ -212,6 +237,7 @@ warp refresh-google               从官方 goog.json 刷新 Google 网段
 warp start | stop                 启停
 warp uninstall                    完整卸载
 
+warp leak                         送中 / 泄漏检测：Google 到底走没走 WARP
 warp doctor                       逐层体检，定位到底卡在哪一层
 warp recover                      一键恢复（重置接入点 + 重连 + 刷新规则）
 ```
@@ -227,9 +253,14 @@ PREFER_REGION=""           # 期望出口国家码，如 JP
 AUTO_REPIN=1               # 漂移时自动换回
 REQUIRE_WARP=1             # WARP 不通时不劫持，保证网页至少能直连打开（强烈建议保持 1）
 CONNECT_TIMEOUT=25         # 等待 WARP 连上的超时秒数
+HIJACK_ALL=0               # 1=接管所有 80/443 出站，不再依赖 Google IP 列表
+GOOGLE_DOMAINS="google.com aistudio.google.com ..."   # 域名解析兜底用的域名
 SCAN_PORTS="2408"          # 扫描端口
 SCAN_EXTRA=""              # 追加扫描的接入点
 ```
+
+**关于 `HIJACK_ALL`**：默认的按网段劫持已经覆盖了官方 `goog.json` 全量 + 域名解析兜底，正常情况下够用。
+只有当你用 `warp leak` 确认「Google 流量有漏网」（[3] 命中 0 包）时，才把它设为 1 —— 代价是**所有** 80/443 出站都会改走 WARP，其它服务的出口 IP 也会变。
 
 改完执行 `warp restart`。
 
@@ -267,6 +298,13 @@ SCAN_EXTRA=""              # 追加扫描的接入点
 11. **WARP 挂了会连带 Google 一起挂** —— 新增「失败即放行」：WARP 不通或 SOCKS5 出不了网时，**不劫持 Google 流量**，保持直连；守护进程也会在检测到不健康时主动撤掉规则。
 12. **换接入点没有回滚** —— 现在 `endpoint set` / `region set` / `nat64 set` 都是「先验证能不能连通、能不能出网，不行就自动回滚到原值」。
 13. **缺少自助排障手段** —— 新增 `warp doctor`（逐层体检）和 `warp recover`（一键恢复）。
+
+### v2.1.0 追加
+
+14. **默认 Google 网段不完整** —— v2.0.0 的精简列表漏掉了 `34.0.0.0/9`、`35.x` 等 Google Cloud 段（原版脚本里是有的），如果某个 Google 服务恰好解析到这些段，流量就会**漏到直连 → 送中**。现在**安装时自动拉取官方 `goog.json` 全量列表**（失败才回退到内置精简列表），并额外把 `GOOGLE_DOMAINS` 里域名实际解析出的 IP 也并进劫持列表。
+15. **无法验证「Google 到底走没走 WARP」** —— 新增 `warp leak`：直连/经 WARP 双路径送中检测 + **清空 iptables 计数器后发请求看是否命中劫持规则**（决定性证据）。
+16. **漏网时没有兜底手段** —— 新增 `HIJACK_ALL=1` 全量接管模式：不看 IP 列表，直接接管所有 80/443 出站，从根本上杜绝 Google 漏网。
+17. **`warp doctor` 增加 Google 送中快检**，体检末尾会提示跑 `warp leak` 做完整分析。
 
 ---
 

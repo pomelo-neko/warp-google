@@ -25,7 +25,7 @@ CYAN=$'\033[0;96m'
 BOLD=$'\033[1m'
 PLAIN=$'\033[0m'
 
-sh_ver="2.0.1"
+sh_ver="2.1.0"
 REPO_URL="https://github.com/pomelo-neko/warp-google"
 ENGINE=/usr/local/bin/warp-google
 WRAPPER=/usr/local/bin/warp
@@ -137,7 +137,7 @@ write_engine() {
     cat > "$ENGINE" <<'WARP_ENGINE_EOF'
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════════════════
-#  warp-google 运行时引擎   v2.0.1
+#  warp-google 运行时引擎   v2.1.0
 #  配置: /etc/warp-google/config      日志: /var/log/warp-google.log
 #  用法: warp-google {start|stop|restart|status|probe|ip|scan|region|...}
 # ══════════════════════════════════════════════════════════════════════
@@ -163,6 +163,9 @@ PREFER_REGION=""           # 期望出口国家/地区两位码，例如 JP / SG
 AUTO_REPIN=1               # 1=出口地区漂移时自动换回最优接入点
 REQUIRE_WARP=1             # 1=WARP 不通时不劫持 Google 流量，保证网页至少能直连打开
 CONNECT_TIMEOUT=25         # 等待 WARP 连上的超时秒数
+HIJACK_ALL=0               # 1=接管所有 80/443 出站（不再依赖 Google IP 列表，杜绝漏网）
+# 用来兜底解析的 Google 域名：解析出来的 IP 会并进劫持列表
+GOOGLE_DOMAINS="google.com www.google.com accounts.google.com aistudio.google.com gemini.google.com makersuite.google.com generativelanguage.googleapis.com aiplatform.googleapis.com www.googleapis.com oauth2.googleapis.com youtube.com www.youtube.com googlevideo.com ytimg.com gstatic.com www.gstatic.com googleusercontent.com lh3.googleusercontent.com mail.google.com drive.google.com"
 SCAN_PORTS="2408"          # 扫描用的接入点端口，空格分隔
 SCAN_EXTRA=""              # 追加到扫描列表的接入点，"IP:PORT IP:PORT"
 
@@ -422,6 +425,24 @@ count_nets() {
 apply_iptables() {
     [ -f "$GOOGLE4" ] || { err "缺少 Google IPv4 网段文件: $GOOGLE4"; return 1; }
     iptables -t nat -N "$CHAIN_NAT" 2>/dev/null || iptables -t nat -F "$CHAIN_NAT"
+
+    # 全量接管模式：不看 Google 网段，任何 80/443 出站都进 WARP，
+    # 从根本上杜绝"某个 Google IP 不在列表里 → 走直连 → 送中"的情况。
+    if [ "$HIJACK_ALL" = "1" ]; then
+        local ex
+        for ex in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
+                  172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.168.0.0/16 \
+                  198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 \
+                  240.0.0.0/4 255.255.255.255/32; do
+            iptables -t nat -A "$CHAIN_NAT" -d "$ex" -j RETURN
+        done
+        iptables -t nat -A "$CHAIN_NAT" -p tcp -m multiport --dports 80,443 \
+            -j REDIRECT --to-ports "$REDSOCKS_PORT"
+        iptables -t nat -C OUTPUT -j "$CHAIN_NAT" 2>/dev/null || iptables -t nat -A OUTPUT -j "$CHAIN_NAT"
+        ok "全量接管模式：所有 80/443 出站流量都走 WARP"
+        return 0
+    fi
+
     local net
     while read -r net; do
         case "$net" in ''|'#'*) continue ;; esac
@@ -884,25 +905,54 @@ cmd_ipv4() {
 
 # ── 刷新 Google 网段（官方 goog.json）────────────────────────────────
 cmd_refresh_google() {
-    info "拉取 https://www.gstatic.com/ipranges/goog.json ..."
     local tmp
     tmp=$(mktemp 2>/dev/null || printf '%s' /tmp/goog.json)
+    info "拉取官方网段 https://www.gstatic.com/ipranges/goog.json ..."
     if curl -4 -s --max-time 25 -o "$tmp" https://www.gstatic.com/ipranges/goog.json && [ -s "$tmp" ]; then
         grep -o '"ipv4Prefix": *"[^"]*"' "$tmp" | sed 's/.*"\([0-9a-fA-F.:/]*\)"/\1/' | sort -u > "$GOOGLE4.new"
         grep -o '"ipv6Prefix": *"[^"]*"' "$tmp" | sed 's/.*"\([0-9a-fA-F.:/]*\)"/\1/' | sort -u > "$GOOGLE6.new"
         if [ -s "$GOOGLE4.new" ] && [ -s "$GOOGLE6.new" ]; then
             mv "$GOOGLE4.new" "$GOOGLE4"
             mv "$GOOGLE6.new" "$GOOGLE6"
-            ok "已更新: $(count_nets "$GOOGLE4") 条 IPv4 / $(count_nets "$GOOGLE6") 条 IPv6"
-            warn "规则已变，执行 warp-google restart 生效"
+            ok "官方全量网段: $(count_nets "$GOOGLE4") 条 IPv4 / $(count_nets "$GOOGLE6") 条 IPv6"
         else
             rm -f "$GOOGLE4.new" "$GOOGLE6.new"
             err "解析 goog.json 失败，保留原列表"
         fi
     else
-        err "下载 goog.json 失败，保留原列表"
+        err "下载 goog.json 失败（可能是网络问题），继续用现有列表"
     fi
     rm -f "$tmp"
+
+    # ── 兜底：把 Google 域名实际解析出来的 IP 也并进劫持列表 ──────
+    # 这一步能覆盖"goog.json 里没有、但 Google 域名确实会解析到"的 IP，
+    # 是防止 Google 流量漏到直连（→ 送中）的最后一道保险。
+    local d gip ips before after added=0
+    : > "$GOOGLE4.dom"
+    for d in $GOOGLE_DOMAINS; do
+        ips=$(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}')
+        [ -n "$ips" ] || ips=$(host -t A "$d" 2>/dev/null | sed -n 's/.*has address //p')
+        for gip in $ips; do
+            case "$gip" in
+                ''|0.*|10.*|100.6[4-9].*|100.[7-9][0-9].*|100.1[0-2][0-9].*|127.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|192.168.*|224.*|2[3-5][0-9].*) continue ;;
+            esac
+            printf '%s/32\n' "$gip" >> "$GOOGLE4.dom"
+        done
+    done
+    if [ -s "$GOOGLE4.dom" ]; then
+        sort -u "$GOOGLE4.dom" > "$GOOGLE4.dom.u"
+        before=$(count_nets "$GOOGLE4")
+        cat "$GOOGLE4" "$GOOGLE4.dom.u" | grep -vE '^[[:space:]]*(#|$)' | sort -u > "$GOOGLE4.m"
+        mv "$GOOGLE4.m" "$GOOGLE4"
+        after=$(count_nets "$GOOGLE4")
+        added=$((after - before))
+        ok "并入域名解析 IP：新增 $added 条，当前共 $after 条 IPv4 规则"
+    else
+        warn "域名解析没取到 IP（DNS 不可用？），已跳过这一步"
+    fi
+    rm -f "$GOOGLE4.dom" "$GOOGLE4.dom.u"
+
+    warn "列表已更新，执行 warp-google restart 生效"
 }
 
 # ── 守护：自动恢复 ───────────────────────────────────────────────────
@@ -984,6 +1034,101 @@ cmd_watchdog() {
     return 0
 }
 
+# ── 送中 / 泄漏检测 ──────────────────────────────────────────────────
+# 判断 Google 是否把当前路径判定为中国大陆：
+#   送中时 google.com 会 302 到 www.google.cn 或 www.google.com.hk
+google_cn_state() {
+    local proxy=$1 hdr code loc
+    hdr=$(curl -4 -s -o /dev/null -D - --max-time 12 $proxy https://www.google.com/ 2>/dev/null)
+    [ -n "$hdr" ] || { printf 'unreachable|连不上 Google'; return; }
+    code=$(printf '%s' "$hdr" | head -1 | awk '{print $2}')
+    loc=$(printf '%s' "$hdr" | sed -n 's/^[Ll]ocation: *//p' | tr -d '\r' | head -1)
+    case "$loc" in
+        *google.cn*|*google.com.hk*)
+            printf 'cn|送中！被跳到 %s' "$loc"; return ;;
+    esac
+    case "$code" in
+        200|204) printf 'ok|正常（HTTP %s）' "$code" ;;
+        30[0-9]) printf 'redirect|重定向到 %s' "$loc" ;;
+        '')      printf 'unreachable|无响应' ;;
+        *)       printf 'http%s|HTTP %s' "$code" "$code" ;;
+    esac
+}
+
+aistudio_code() {
+    local proxy=$1
+    curl -4 -s -o /dev/null -w '%{http_code}' --max-time 15 $proxy https://aistudio.google.com/ 2>/dev/null
+}
+
+f2() { printf '%s' "$1" | cut -d'|' -f2; }
+
+cmd_leak() {
+    printf '%s\n' "════════ Google 送中 / 泄漏检测 ════════"
+    local d w wstate gip ip4 ip6 hit
+
+    printf '\n[1] 直连路径（临时绕过劫持，看 VPS 自己的 IP 在 Google 眼里属于哪里）\n'
+    gip=$(getent ahostsv4 www.google.com 2>/dev/null | awk '{print $1}' | head -1)
+    if [ -n "$gip" ] && iptables -t nat -I "$CHAIN_NAT" 1 -d "$gip" -p tcp -j RETURN 2>/dev/null; then
+        d=$(google_cn_state "")
+        printf '  google.com      : %s\n' "$(f2 "$d")"
+        printf '  aistudio 状态码 : %s\n' "$(aistudio_code "")"
+        ip4=$(curl -4 -s --max-time 8 https://api.ip.sb/ip 2>/dev/null | tr -d ' \n')
+        printf '  出口 IPv4       : %s\n' "${ip4:-未知}"
+        iptables -t nat -D "$CHAIN_NAT" -d "$gip" -p tcp -j RETURN 2>/dev/null
+    else
+        warn "无法临时绕过劫持链做直连测试（缺少 iptables 权限或没解析到 IP）"
+    fi
+
+    printf '\n[2] WARP 路径（劫持生效后 Google 实际看到的）\n'
+    if [ "$(warp_state)" = "connected" ] && probe_trace 4 >/dev/null 2>&1; then
+        w=$(google_cn_state "-x socks5://127.0.0.1:$WARP_PROXY_PORT")
+        printf '  google.com      : %s\n' "$(f2 "$w")"
+        printf '  aistudio 状态码 : %s\n' "$(aistudio_code "-x socks5://127.0.0.1:$WARP_PROXY_PORT")"
+        printf '  WARP 出口 IPv4  : %s\n' "$(probe_trace 4 | cut -d'|' -f1)"
+        ip6=$(probe_trace 6 | cut -d'|' -f1)
+        printf '  WARP 出口 IPv6  : %s\n' "${ip6:-不可用（被 IPv4-only 屏蔽，正常）}"
+    else
+        warn "WARP 未连接或 SOCKS5 不通，跳过"
+    fi
+
+    printf '\n[3] 实际路径验证（最关键）：Google 到底有没有走 WARP\n'
+    iptables -t nat -Z "$CHAIN_NAT" >/dev/null 2>&1
+    curl -4 -s -o /dev/null --max-time 12 https://www.google.com/ 2>/dev/null
+    curl -4 -s -o /dev/null --max-time 12 https://aistudio.google.com/ 2>/dev/null
+    sleep 1
+    hit=$(iptables -t nat -L "$CHAIN_NAT" -v -n 2>/dev/null | awk '/REDIRECT|redir ports/ {s += $1} END {print s + 0}')
+    printf '  命中劫持规则的包数: %s\n' "$hit"
+    if [ "${hit:-0}" -gt 0 ]; then
+        ok "Google 流量确实被劫持进 WARP 了，没有漏到直连"
+    else
+        warn "Google 流量一个包都没命中劫持规则 —— 它走了直连，"
+        warn "也就是说 Google 看到的是你 VPS 自己的 IP，改接入点/地区当然怎么改都没用。"
+        warn "修复: warp refresh-google && warp restart"
+        warn "若列表已全量仍漏，在 /etc/warp-google/config 里设 HIJACK_ALL=1 后 warp restart（全量接管 80/443）"
+    fi
+
+    printf '\n[4] 当前拦截方式\n'
+    printf '  劫持规则        : %s 条 (HIJACK_ALL=%s)\n' "$(iptables -t nat -S "$CHAIN_NAT" 2>/dev/null | grep -c REDIRECT)" "$HIJACK_ALL"
+    printf '  QUIC 阻断       : %s 条\n' "$(iptables -t filter -S "$CHAIN_FLT" 2>/dev/null | grep -c REJECT)"
+    printf '  Google v6 黑洞  : %s 条\n' "$(ip -6 route show type blackhole 2>/dev/null | grep -c '/')"
+
+    printf '\n[5] 结论\n'
+    wstate=$(printf '%s' "$w" | cut -d'|' -f1)
+    if [ "$wstate" = "cn" ]; then
+        warn "WARP 出口本身就被 Google 判定为中国大陆 —— 换接入点、换地区都不会有用。"
+        warn "出路只有换出口：目标地区的小鸡做落地、或住宅/原生 IP 代理，别再折腾 WARP 了。"
+    elif [ "$wstate" = "ok" ] && [ "${hit:-0}" -gt 0 ]; then
+        ok "WARP 出口正常，且 Google 流量确实走了 WARP —— IP 这一层是干净的。"
+        warn "如果 AI Studio 仍然打不开，问题多半不在 IP 层：先用无痕窗口 + 清 cookie 再试，"
+        warn "仍然不行就检查 Google 账号本身的地区设置（账号国家会单独限制部分服务）。"
+    elif [ "${hit:-0}" -eq 0 ]; then
+        warn "结论：Google 流量没走 WARP（见上面 [3]），先把这一步修好。"
+    else
+        warn "WARP 路径不可用，先执行 warp recover。"
+    fi
+    printf '%s\n' "═════════════════════════════════════════"
+}
+
 # ── 一键恢复到已知可用状态 ───────────────────────────────────────────
 cmd_recover() {
     info "恢复中：重置接入点 → 重连 → 刷新规则"
@@ -1050,18 +1195,24 @@ cmd_doctor() {
     printf '  QUIC 阻断     : %s 条\n' "$nq"
     printf '  IPv6 黑洞     : %s 条\n' "$(ip -6 route show type blackhole 2>/dev/null | grep -c '/')"
 
-    printf '\n[5] 结论\n'
+    printf '\n[5] Google 送中快检（经 WARP）\n'
+    local cs
+    cs=$(google_cn_state "-x socks5://127.0.0.1:$WARP_PROXY_PORT")
+    printf '  google.com : %s\n' "$(f2 "$cs")"
+
+    printf '\n[6] 结论\n'
     if [ "$n4" -gt 0 ] && [ -z "$tr" ]; then
         warn "劫持规则还在，但 WARP 出不了网 —— 这就是 Google 打不开的直接原因"
         warn "执行：warp recover"
     elif [ "$n4" -gt 0 ]; then
-        ok "劫持生效且 WARP 可用，链路正常"
+        ok "劫持生效且 WARP 可用"
     else
         ok "当前没有劫持 Google 流量（走直连，网页能打开）"
         if [ "$st" != "connected" ]; then
             warn "WARP 未连接，所以没接管。修好后执行 warp start"
         fi
     fi
+    warn "要做完整的送中 / 泄漏分析，执行：warp leak"
     printf '%s\n' "══════════════════════════════════"
 }
 
@@ -1069,6 +1220,7 @@ cmd_doctor() {
 case "$1" in
     recover)        cmd_recover ;;
     doctor)         cmd_doctor ;;
+    leak|cn)        cmd_leak ;;
     start)          do_start ;;
     stop)           do_stop ;;
     restart)        do_stop; sleep 1; do_start ;;
@@ -1083,7 +1235,7 @@ case "$1" in
     watchdog)       cmd_watchdog ;;
     *)
         cat <<'USAGE_EOF'
-warp-google —— WARP Google 透明代理运行时 (v2.0.1)
+warp-google —— WARP Google 透明代理运行时 (v2.1.0)
 
   start / stop / restart          启停透明代理
   status                          完整状态 + 当前出口 IP / 地区
@@ -1096,6 +1248,7 @@ warp-google —— WARP Google 透明代理运行时 (v2.0.1)
                                   手动指定 / 清除接入点
   ipv4   [on|off]                 强制 IPv4 开关
   refresh-google                  从官方 goog.json 刷新 Google 网段
+  leak                            送中 / 泄漏检测：Google 到底有没有走 WARP
   recover                         一键恢复（重置接入点 + 重连 + 刷新规则）
   doctor                          逐层体检，定位到底卡在哪一层
   watchdog                        守护自检（由 systemd timer 调用）
@@ -1197,6 +1350,9 @@ AUTO_REPIN=1
 # 1 = WARP 不通时不劫持 Google 流量（保证网页至少能直连打开）
 #     强烈建议保持 1，否则 WARP 一挂 Google 就会彻底打不开
 REQUIRE_WARP=1
+# 1 = 全量接管所有 80/443 出站流量（不再依赖 Google IP 列表）
+#     如果你确认 Google 流量有漏网（warp leak 的 [3] 没命中），把它设为 1 最稳
+HIJACK_ALL=0
 # 等待 WARP 连上的超时秒数
 CONNECT_TIMEOUT=25
 # 扫描用端口
@@ -1372,7 +1528,7 @@ INSTALLER=/usr/local/bin/warp-google.sh
 RAW_URL="https://raw.githubusercontent.com/pomelo-neko/warp-google/main/warp-google.sh"
 
 case "$1" in
-    status|start|stop|restart|probe|scan|region|nat64|endpoint|ipv4|watchdog|refresh-google|recover|doctor)
+    status|start|stop|restart|probe|scan|region|nat64|endpoint|ipv4|watchdog|refresh-google|recover|doctor|leak)
         [ -x "$ENGINE" ] || { echo "warp-google 未安装，请先执行安装脚本"; exit 1; }
         exec "$ENGINE" "$@"
         ;;
@@ -1423,6 +1579,7 @@ case "$1" in
     warp nat64 set us
 
   出问题了（Google 打不开时按这个顺序来）
+    warp leak                    送中 / 泄漏检测：Google 到底有没有走 WARP
     warp doctor                  逐层体检，看到底卡在哪一层
     warp recover                 一键恢复：重置接入点 + 重连 + 刷新规则
     warp endpoint reset          只重置接入点（回到 Cloudflare 自动任播）
@@ -1557,6 +1714,10 @@ do_install() {
     write_systemd
 
     hr
+    info "同步 Google 官方网段（goog.json + 域名解析兜底）..."
+    "$ENGINE" refresh-google || warn "拉取失败，继续使用内置精简列表"
+
+    hr
     info "启动透明代理与规则..."
     "$ENGINE" start
 
@@ -1683,13 +1844,14 @@ show_menu() {
     printf '  %s8.%s  重启透明代理\n' "$GREEN" "$PLAIN"
     printf '\n'
     printf '  %s9.%s  一键恢复（Google 打不开时先选这个） %s←%s\n' "$GREEN" "$PLAIN" "$YELLOW" "$PLAIN"
-    printf '  %s10.%s 逐层体检诊断（看到底卡在哪一层）\n' "$GREEN" "$PLAIN"
-    printf '  %s11.%s 完整卸载\n' "$GREEN" "$PLAIN"
+    printf '  %s10.%s Google 送中 / 泄漏检测（看 Google 到底走没走 WARP）\n' "$GREEN" "$PLAIN"
+    printf '  %s11.%s 逐层体检诊断\n' "$GREEN" "$PLAIN"
+    printf '  %s12.%s 完整卸载\n' "$GREEN" "$PLAIN"
     printf '\n'
     printf '  %s0.%s  退出\n' "$GREEN" "$PLAIN"
     printf '\n'
     hr
-    read -rp "  请输入选项 [0-11]: " choice
+    read -rp "  请输入选项 [0-12]: " choice
     printf '\n'
     case "$choice" in
         1) do_install ;;
@@ -1723,13 +1885,14 @@ show_menu() {
         7) [ -x "$ENGINE" ] && "$ENGINE" refresh-google && "$ENGINE" restart ;;
         8) [ -x "$ENGINE" ] && "$ENGINE" restart ;;
         9) if [ -x "$ENGINE" ]; then "$ENGINE" recover; else warn "请先安装"; fi ;;
-        10) if [ -x "$ENGINE" ]; then "$ENGINE" doctor; else warn "请先安装"; fi ;;
-        11)
+        10) if [ -x "$ENGINE" ]; then "$ENGINE" leak; else warn "请先安装"; fi ;;
+        11) if [ -x "$ENGINE" ]; then "$ENGINE" doctor; else warn "请先安装"; fi ;;
+        12)
             read -rp "  确认完整卸载? [y/N]: " cu
             if [[ "$cu" =~ ^[Yy]$ ]]; then do_uninstall; else warn "已取消"; fi
             ;;
         0) printf '%s  再见！%s\n\n' "$GREEN" "$PLAIN"; exit 0 ;;
-        *) error "无效选项，请输入 0-11" ;;
+        *) error "无效选项，请输入 0-12" ;;
     esac
     printf '\n'
     read -n1 -rp "  按任意键继续..." _
@@ -1746,7 +1909,7 @@ case "$1" in
     status)    show_status ;;
     test)      do_test ;;
     menu|"")   show_menu ;;
-    ip|probe|start|stop|restart|scan|region|nat64|endpoint|ipv4|watchdog|refresh-google|recover|doctor)
+    ip|probe|start|stop|restart|scan|region|nat64|endpoint|ipv4|watchdog|refresh-google|recover|doctor|leak)
         if [ -x "$ENGINE" ]; then
             exec "$ENGINE" "$@"
         fi
