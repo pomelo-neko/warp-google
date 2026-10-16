@@ -1319,13 +1319,34 @@ do_install() {
 do_uninstall() {
     hr
     info "正在完整卸载..."
-    systemctl disable --now warp-google-watchdog.timer >/dev/null 2>&1
-    systemctl disable --now warp-google >/dev/null 2>&1
-    [ -x "$ENGINE" ] && "$ENGINE" stop >/dev/null 2>&1
+    # ── 1) 先停：stop 会触发 ExecStop=/usr/local/bin/warp-google stop
+    #        （此时引擎还在，能正常清掉 iptables / IPv6 黑洞）
+    systemctl stop warp-google-watchdog.timer   >/dev/null 2>&1
+    systemctl stop warp-google-watchdog.service >/dev/null 2>&1
+    systemctl stop warp-google.service          >/dev/null 2>&1
+
+    # ── 2) 再去掉开机自启（删 multi-user.target.wants / timers.target.wants 软链）
+    systemctl disable warp-google-watchdog.timer >/dev/null 2>&1
+    systemctl disable warp-google.service        >/dev/null 2>&1
+
+    # ── 3) 删 unit 文件，并显式清掉可能残留的 enable 软链
+    #        （systemctl disable 失败时会留下悬空软链，daemon-reload 会报 warning）
     rm -f /etc/systemd/system/warp-google.service \
           /etc/systemd/system/warp-google-watchdog.service \
           /etc/systemd/system/warp-google-watchdog.timer
-    systemctl daemon-reload >/dev/null 2>&1
+    rm -f /etc/systemd/system/multi-user.target.wants/warp-google.service \
+          /etc/systemd/system/timers.target.wants/warp-google-watchdog.timer
+    rm -f /etc/systemd/system/*.wants/warp-google.service \
+          /etc/systemd/system/*.wants/warp-google-watchdog.service \
+          /etc/systemd/system/*.wants/warp-google-watchdog.timer
+
+    # ── 4) 让 systemd 真正忘掉这几个 unit（含 failed 记录）
+    systemctl daemon-reload   >/dev/null 2>&1
+    systemctl reset-failed warp-google.service warp-google-watchdog.service \
+        warp-google-watchdog.timer >/dev/null 2>&1
+
+    # 兜底：万一 systemd 没接住（容器 / 非 systemd 环境），手动再停一次引擎
+    [ -x "$ENGINE" ] && "$ENGINE" stop >/dev/null 2>&1
 
     pkill -x redsocks 2>/dev/null
     iptables -t nat -D OUTPUT -j WARP_GOOGLE 2>/dev/null
@@ -1363,6 +1384,18 @@ do_uninstall() {
         if [[ "$del_conf" =~ ^[Yy]$ ]]; then
             rm -rf "$CONF_DIR" /var/log/warp-google.log
         fi
+    fi
+    # ── 校验 systemd 是否真的清干净了
+    local left
+    left=$(systemctl list-unit-files 'warp-google*' --no-legend 2>/dev/null | awk '{print $1}' | tr '\n' ' ')
+    if [ -n "$left" ]; then
+        warn "systemd 里仍残留: $left"
+        warn "可手动执行: systemctl daemon-reload && systemctl reset-failed $left"
+    else
+        ok "systemd 单元已清理干净（warp-google.service + watchdog.service + watchdog.timer）"
+    fi
+    if pgrep -x warp-svc >/dev/null 2>&1 || pgrep -x warp-cli >/dev/null 2>&1; then
+        warn "warp-svc 仍在运行，可执行: systemctl stop warp-svc"
     fi
     hr
     ok "WARP for Google 已完整卸载"
