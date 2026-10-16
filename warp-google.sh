@@ -25,7 +25,7 @@ CYAN=$'\033[0;96m'
 BOLD=$'\033[1m'
 PLAIN=$'\033[0m'
 
-sh_ver="2.0.0"
+sh_ver="2.0.1"
 REPO_URL="https://github.com/pomelo-neko/warp-google"
 ENGINE=/usr/local/bin/warp-google
 WRAPPER=/usr/local/bin/warp
@@ -137,7 +137,7 @@ write_engine() {
     cat > "$ENGINE" <<'WARP_ENGINE_EOF'
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════════════════
-#  warp-google 运行时引擎   v2.0.0
+#  warp-google 运行时引擎   v2.0.1
 #  配置: /etc/warp-google/config      日志: /var/log/warp-google.log
 #  用法: warp-google {start|stop|restart|status|probe|ip|scan|region|...}
 # ══════════════════════════════════════════════════════════════════════
@@ -161,6 +161,8 @@ BLACKHOLE_GOOGLE_V6=1      # 1=给 Google IPv6 段加黑洞路由，逼应用回
 BLOCK_GOOGLE_QUIC=1        # 1=丢弃发往 Google 的 UDP/443，防止 QUIC 绕过透明代理
 PREFER_REGION=""           # 期望出口国家/地区两位码，例如 JP / SG / US / NL
 AUTO_REPIN=1               # 1=出口地区漂移时自动换回最优接入点
+REQUIRE_WARP=1             # 1=WARP 不通时不劫持 Google 流量，保证网页至少能直连打开
+CONNECT_TIMEOUT=25         # 等待 WARP 连上的超时秒数
 SCAN_PORTS="2408"          # 扫描用的接入点端口，空格分隔
 SCAN_EXTRA=""              # 追加到扫描列表的接入点，"IP:PORT IP:PORT"
 
@@ -211,10 +213,19 @@ wcliout() {
     fi
     warp-cli "$@" 2>/dev/null
 }
+
+# 状态原始输出：故意把 stderr 也收进来。
+# 不同版本的 warp-cli 有的把状态打到 stderr，只收 stdout 会得到空串，
+# 于是「明明连着」却被判成 unknown —— 扫描时就会把可用接入点全部标成失败。
+warp_status_raw() {
+    { warp-cli --accept-tos status 2>&1 || warp-cli status 2>&1 || true; } \
+        | sed 's/\x1b\[[0-9;]*m//g'
+}
+
 # 注意：必须先判断 disconnected，否则 "Disconnected" 会被 connected 命中
 warp_state() {
     local s
-    s=$(wcliout status 2>/dev/null | tr 'A-Z' 'a-z')
+    s=$(warp_status_raw | sed 's/\x1b\[[0-9;]*m//g' | tr 'A-Z' 'a-z')
     case "$s" in
         *disconnected*)        printf 'disconnected' ;;
         *"unable to connect"*) printf 'failed' ;;
@@ -223,6 +234,31 @@ warp_state() {
         *connected*)           printf 'connected' ;;
         *)                     printf 'unknown' ;;
     esac
+}
+
+# 等待 WARP 连上：connecting / unknown 继续等，只有明确失败才提前退出。
+# 旧实现只等 10 秒且把 unknown 当失败，慢一点的接入点会被误判。
+wait_connected() {
+    local timeout=$1 i st streak=0
+    [ -n "$timeout" ] || timeout=${CONNECT_TIMEOUT:-25}
+    for i in $(seq 1 "$timeout"); do
+        st=$(warp_state)
+        case "$st" in
+            connected)         printf 'connected'; return 0 ;;
+            failed|no-network) printf '%s' "$st";  return 1 ;;
+            unknown)           streak=$((streak + 1)) ;;
+            *)                 streak=0 ;;
+        esac
+        [ "$streak" -ge 8 ] && { printf 'unknown'; return 1; }
+        sleep 1
+    done
+    printf '%s' "$(warp_state)"
+    return 1
+}
+
+# WARP 的 SOCKS5 是否真的能出网（能出网才值得把 Google 流量劫持进来）
+warp_socks_ok() {
+    probe_trace 4 >/dev/null 2>&1
 }
 
 endpoint_set() {
@@ -245,6 +281,39 @@ endpoint_show() {
     else
         printf '%s\n' "（当前 warp-cli 不支持查询接入点，请用 /etc/warp-google/config 里的 ENDPOINT）"
     fi
+}
+
+# 换接入点并当场验证：连不上 / 出不了网就自动回滚到原来的值。
+# 这样「换接入点」这个动作再也不会把 WARP 搞死。
+apply_endpoint_verified() {
+    local ep=$1 prev=$2 st
+    if ! endpoint_set "$ep"; then
+        err "设置接入点失败（当前 warp-cli 不支持自定义接入点）"
+        return 1
+    fi
+    wcli disconnect
+    sleep 1
+    wcli connect
+    st=$(wait_connected "$CONNECT_TIMEOUT")
+    if [ "$st" = "connected" ] && warp_socks_ok; then
+        cfg_set ENDPOINT "$ep"
+        ok "接入点 $ep 可用，已保存"
+        return 0
+    fi
+    warn "接入点 $ep 不可用（状态: $st），自动回滚"
+    if [ -n "$prev" ]; then
+        endpoint_set "$prev" >/dev/null 2>&1
+        cfg_set ENDPOINT "$prev"
+    else
+        endpoint_reset >/dev/null 2>&1
+        cfg_set ENDPOINT ""
+    fi
+    wcli disconnect
+    sleep 1
+    wcli connect
+    st=$(wait_connected "$CONNECT_TIMEOUT")
+    warn "已回滚（状态: $st）"
+    return 1
 }
 
 # ── 出口探测 ─────────────────────────────────────────────────────────
@@ -424,20 +493,45 @@ do_start() {
         endpoint_set "$ENDPOINT" || warn "当前 warp-cli 不支持自定义接入点，退回自动任播"
     fi
 
-    local st i
+    local st
     st=$(warp_state)
     if [ "$st" != "connected" ]; then
         info "连接 WARP ..."
         wcli connect
-        for i in 1 2 3 4 5 6 7 8 9 10; do
-            sleep 1
-            st=$(warp_state)
-            [ "$st" = "connected" ] && break
-        done
+        st=$(wait_connected "$CONNECT_TIMEOUT")
     fi
-    if [ "$st" = "connected" ]; then ok "WARP 已连接"; else warn "WARP 状态异常: $st"; fi
+    if [ "$st" = "connected" ]; then
+        ok "WARP 已连接"
+    else
+        warn "WARP 未连接（状态: $st）"
+    fi
 
     ensure_redsocks || warn "redsocks 启动失败，透明代理可能不生效"
+
+    # ── 失败即放行 ───────────────────────────────────────────────
+    # WARP 不通时绝对不能装劫持规则：redsocks 会把请求转给一个连不上的
+    # SOCKS5，结果是 Google 直接打不开，而其它网站一切正常。
+    # 宁可不接管（网页能打开，只是地区可能不理想），也不要全断。
+    if [ "$REQUIRE_WARP" = "1" ]; then
+        if [ "$st" != "connected" ]; then
+            warn "WARP 未连接 —— 本次不劫持 Google 流量，保持直连（网页至少能打开）"
+            warn "修好之后执行：warp recover"
+            clear_iptables
+            clear_quic_block
+            [ "$BLACKHOLE_GOOGLE_V6" = "1" ] && apply_v6_blackhole
+            log "start: WARP 不可用($st)，已放行直连，未安装劫持规则"
+            return 0
+        fi
+        if ! warp_socks_ok; then
+            warn "WARP 显示已连接，但 SOCKS5 代理出不了网 —— 同样不劫持，保持直连"
+            warn "修好之后执行：warp recover"
+            clear_iptables
+            clear_quic_block
+            log "start: SOCKS5 不通，已放行直连，未安装劫持规则"
+            return 0
+        fi
+    fi
+
     apply_iptables
     [ "$BLACKHOLE_GOOGLE_V6" = "1" ] && apply_v6_blackhole
     [ "$BLOCK_GOOGLE_QUIC" = "1" ] && apply_quic_block
@@ -491,16 +585,21 @@ cmd_endpoint() {
         set)
             local ep=$1
             [ -n "$ep" ] || { err "用法: warp-google endpoint set IP:PORT"; return 1; }
-            endpoint_set "$ep" || { err "设置接入点失败（warp-cli 可能不支持）"; return 1; }
-            cfg_set ENDPOINT "$ep"
-            wcli disconnect; sleep 1; wcli connect; sleep 5
-            ok "接入点已锁定为 $ep，状态: $(warp_state)"
+            apply_endpoint_verified "$ep" "$ENDPOINT" || return 1
+            do_start >/dev/null 2>&1
+            show_exit
             ;;
         reset|off)
             endpoint_reset
             cfg_set ENDPOINT ""
-            wcli disconnect; sleep 1; wcli connect; sleep 5
-            ok "已恢复 Cloudflare 自动任播"
+            wcli disconnect
+            sleep 1
+            wcli connect
+            local rst
+            rst=$(wait_connected "$CONNECT_TIMEOUT")
+            ok "已恢复 Cloudflare 自动任播，状态: $rst"
+            do_start >/dev/null 2>&1
+            ok "透明代理规则已按新状态刷新"
             ;;
         *) err "用法: warp-google endpoint {show|set IP:PORT|reset}" ;;
     esac
@@ -526,9 +625,49 @@ cmd_scan() {
 
     command -v warp-cli >/dev/null 2>&1 || die "warp-cli 未安装"
 
+    # ── 先保存现场，扫描结束后无条件恢复 ─────────────────────────
+    # 扫描靠反复改写 warp-cli 的接入点来实现，中途被打断/失败时若不恢复，
+    # warp-cli 会一直卡在最后一个（可能不通的）接入点上：劫持规则还在、
+    # WARP 却连不上 —— 结果就是 Google 彻底打不开。
+    local saved_ep="$ENDPOINT"
+    local scan_restored=0
+
+    restore_scene() {
+        [ "$scan_restored" = "1" ] && return 0
+        scan_restored=1
+        printf '\n'
+        info "恢复扫描前的接入点设置..."
+        if [ -n "$saved_ep" ]; then
+            endpoint_set "$saved_ep" >/dev/null 2>&1
+        else
+            endpoint_reset >/dev/null 2>&1
+        fi
+        wcli disconnect
+        sleep 1
+        wcli connect
+        local rst
+        rst=$(wait_connected "$CONNECT_TIMEOUT")
+        if [ "$rst" = "connected" ]; then
+            ok "已恢复接入点: ${saved_ep:-Cloudflare 自动任播}"
+            do_start >/dev/null 2>&1
+            ok "透明代理规则已重新生效"
+        else
+            warn "恢复后 WARP 状态仍为 $rst —— 保持直连，Google 不会打不开"
+            warn "可执行 warp recover 重试"
+        fi
+    }
+    trap 'restore_scene; trap - INT TERM; exit 130' INT TERM
+
+    # 扫描期间先撤掉劫持规则：否则 WARP 一断，Google 会卡死而不是回落直连
+    info "扫描期间会临时撤掉 Google 劫持规则并反复重连，网页会短暂走直连"
+    clear_iptables
+    clear_quic_block
+
     if ! endpoint_set "162.159.192.1:2408"; then
         err "当前 warp-cli 版本不支持自定义接入点（set-custom-endpoint / tunnel endpoint set）"
         err "请升级 warp-cli，或改用 nat64 方式更换落地"
+        restore_scene
+        trap - INT TERM
         return 1
     fi
 
@@ -538,34 +677,29 @@ cmd_scan() {
 
     local total=0
     for e in $list; do total=$((total + 1)); done
-    info "共 $total 个候选接入点，开始逐个探测（每个约 5~12 秒，请耐心等待）"
+    info "共 $total 个候选接入点，每个最多等 $CONNECT_TIMEOUT 秒，请耐心等待"
     : > "$SCAN_TSV"
 
-    local ep t0 t1 cost st i tr ip cc colo good=0
+    local ep t0 t1 cost st tr ip cc colo good=0
     for ep in $list; do
         printf '  → %-24s' "$ep"
         endpoint_set "$ep" >/dev/null 2>&1
-        wcli disconnect; sleep 1
+        wcli disconnect
+        sleep 1
         t0=$(date +%s)
         wcli connect
-        st=""
-        for i in 1 2 3 4 5 6 7 8 9 10; do
-            sleep 1
-            st=$(warp_state)
-            [ "$st" = "connected" ] && break
-            [ "$st" = "failed" ] && break
-        done
+        st=$(wait_connected "$CONNECT_TIMEOUT")
         t1=$(date +%s)
         cost=$((t1 - t0))
         if [ "$st" != "connected" ]; then
-            printf ' × 连不上 (%ss)\n' "$cost"
-            printf '%s\tFAIL\t-\t%s\t-\n' "$ep" "$cost" >> "$SCAN_TSV"
+            printf ' × 连不上 (%ss, %s)\n' "$cost" "$st"
+            printf '%s\tFAIL-%s\t-\t%s\t-\n' "$ep" "$st" "$cost" >> "$SCAN_TSV"
             continue
         fi
         sleep 2
         tr=$(probe_trace 4)
         if [ -z "$tr" ]; then
-            printf ' × 拿不到出口信息\n'
+            printf ' ! 连上了但拿不到出口信息 (%ss)\n' "$cost"
             printf '%s\tNO-TRACE\t-\t%s\t-\n' "$ep" "$cost" >> "$SCAN_TSV"
             continue
         fi
@@ -579,11 +713,20 @@ cmd_scan() {
 
     printf '\n%s\n' "════════ 扫描完成：$good/$total 个接入点可用 ════════"
     printf '%s\n' "可用出口地区统计:"
-    awk -F'\t' '$2!="FAIL" && $2!="NO-TRACE" {print $2}' "$SCAN_TSV" | sort | uniq -c | sort -rn \
+    awk -F'\t' '$2 !~ /^(FAIL|NO-TRACE)/ {print $2}' "$SCAN_TSV" | sort | uniq -c | sort -rn \
         | awk '{printf "  %-4s × %s 个接入点\n", $2, $1}'
     printf '\n%s\n' "接入点明细（地区 / colo / 握手耗时 / 出口IP）:"
-    awk -F'\t' '$2!="FAIL" && $2!="NO-TRACE" {printf "  %-24s %-4s %-6s %3ss  %s\n",$1,$2,$3,$4,$5}' "$SCAN_TSV" \
+    awk -F'\t' '$2 !~ /^(FAIL|NO-TRACE)/ {printf "  %-24s %-4s %-6s %3ss  %s\n",$1,$2,$3,$4,$5}' "$SCAN_TSV" \
         | sort -k2
+    if [ "$good" = "0" ]; then
+        printf '\n'
+        warn "一个都没连上。常见原因：VPS 到 Cloudflare WARP 接入点的 UDP 被阻断，"
+        warn "或当前 warp-cli 版本对自定义接入点支持有问题（可执行 warp doctor 看细节）。"
+        warn "请务必确认已恢复自动接入点：warp endpoint reset && warp recover"
+    fi
+
+    restore_scene
+    trap - INT TERM
     printf '\n提示: warp-google region set <地区码>   锁定你想要的地区（例如 region set JP）\n'
     return 0
 }
@@ -617,10 +760,12 @@ cmd_region() {
             best=$(awk -F'\t' -v w="$want" '$2==w {print $4"\t"$1}' "$SCAN_TSV" | sort -n | head -1 | cut -f2)
             [ -n "$best" ] || { err "扫描结果里没有地区 $want，可先运行 warp-google region list 查看"; return 1; }
             info "锁定接入点 $best（目标地区 $want）"
-            endpoint_set "$best" || { err "设置接入点失败"; return 1; }
-            cfg_set ENDPOINT "$best"
+            if ! apply_endpoint_verified "$best" "$ENDPOINT"; then
+                err "接入点 $best 不可用，配置未改动"
+                return 1
+            fi
             cfg_set PREFER_REGION "$want"
-            wcli disconnect; sleep 1; wcli connect; sleep 6
+            do_start >/dev/null 2>&1
             local cur
             cur=$(probe_trace 4 | cut -d'|' -f2)
             if [ "$cur" = "$want" ]; then
@@ -688,18 +833,23 @@ cmd_nat64() {
                 warn "本机似乎没有可用 IPv6，NAT64 方案无法工作"
             fi
             info "NAT64 落地 $name → $ep"
-            endpoint_set "$ep" || { err "设置接入点失败（warp-cli 可能不支持 IPv6 接入点）"; return 1; }
-            cfg_set ENDPOINT "$ep"
             cfg_set PREFER_REGION ""
-            wcli disconnect; sleep 1; wcli connect; sleep 6
-            printf '  状态: %s\n' "$(warp_state)"
+            if ! apply_endpoint_verified "$ep" "$ENDPOINT"; then
+                err "NAT64 接入点不可用（可能本机没有 IPv6，或 warp-cli 不支持 IPv6 接入点）"
+                err "已自动回滚到原接入点"
+                return 1
+            fi
+            do_start >/dev/null 2>&1
             show_exit
             ;;
         off)
             endpoint_reset
             cfg_set ENDPOINT ""
-            wcli disconnect; sleep 1; wcli connect; sleep 5
-            ok "已取消自定义接入点，恢复 Cloudflare 自动任播"
+            wcli disconnect
+            sleep 1
+            wcli connect
+            ok "已取消自定义接入点，状态: $(wait_connected "$CONNECT_TIMEOUT")"
+            do_start >/dev/null 2>&1
             ;;
         *) err "用法: warp-google nat64 {list|set 代号|off}" ;;
     esac
@@ -779,15 +929,30 @@ repin_region() {
 
 cmd_watchdog() {
     log_rotate
-    local st
+    local st healthy=1
     st=$(warp_state)
     if [ "$st" != "connected" ]; then
         log "watchdog: 状态=$st，重连"
         wcli connect
-        sleep 6
-        st=$(warp_state)
+        st=$(wait_connected "$CONNECT_TIMEOUT")
         [ "$st" = "connected" ] || log "watchdog: 重连后仍为 $st"
     fi
+
+    # ── 失败即放行 ───────────────────────────────────────────────
+    # WARP 不健康时必须撤掉劫持，否则 Google 会被转进一个连不上的 SOCKS5
+    [ "$st" = "connected" ] || healthy=0
+    if [ "$healthy" = "1" ]; then
+        warp_socks_ok || healthy=0
+    fi
+    if [ "$REQUIRE_WARP" = "1" ] && [ "$healthy" = "0" ]; then
+        if iptables -t nat -C OUTPUT -j "$CHAIN_NAT" >/dev/null 2>&1; then
+            log "watchdog: WARP 不健康($st)，撤掉 Google 劫持规则改为直连"
+            clear_iptables
+            clear_quic_block
+        fi
+        return 0
+    fi
+
     if ! pgrep -x redsocks >/dev/null 2>&1; then
         log "watchdog: redsocks 掉了，重启"
         ensure_redsocks >/dev/null 2>&1
@@ -819,8 +984,91 @@ cmd_watchdog() {
     return 0
 }
 
+# ── 一键恢复到已知可用状态 ───────────────────────────────────────────
+cmd_recover() {
+    info "恢复中：重置接入点 → 重连 → 刷新规则"
+    endpoint_reset >/dev/null 2>&1
+    cfg_set ENDPOINT ""
+    cfg_set PREFER_REGION ""
+    wcli disconnect >/dev/null 2>&1
+    sleep 1
+    wcli connect >/dev/null 2>&1
+    local st
+    st=$(wait_connected "$CONNECT_TIMEOUT")
+    printf '  WARP 状态: %s\n' "$st"
+    if [ "$st" = "connected" ] && warp_socks_ok; then
+        ok "WARP 已恢复，重新安装 Google 劫持规则..."
+        do_start
+        printf '\n'
+        show_exit
+        return 0
+    fi
+    warn "WARP 仍然不通（状态: $st）—— 已保持直连，Google 可以正常打开"
+    warn "执行 warp doctor 可以看到具体卡在哪一层"
+    clear_iptables
+    clear_quic_block
+    [ "$BLACKHOLE_GOOGLE_V6" = "1" ] && apply_v6_blackhole
+    return 1
+}
+
+# ── 逐层体检 ─────────────────────────────────────────────────────────
+cmd_doctor() {
+    printf '%s\n' "════════ warp-google 体检 ════════"
+    printf '\n[1] 组件\n'
+    if command -v warp-cli >/dev/null 2>&1; then
+        printf '  warp-cli      : %s\n' "$(warp-cli --version 2>/dev/null | head -1 || echo '已安装(版本未知)')"
+    else
+        printf '  warp-cli      : 未安装\n'
+    fi
+    printf '  warp-svc      : %s\n' "$(systemctl is-active warp-svc 2>/dev/null || echo 未知)"
+    printf '  redsocks      : %s\n' "$(pgrep -x redsocks >/dev/null 2>&1 && echo 运行中 || echo 未运行)"
+    printf '  redsocks 配置 : %s\n' "$([ -f /etc/redsocks.conf ] && echo 存在 || echo 缺失)"
+
+    printf '\n[2] WARP 连接\n'
+    local st
+    st=$(warp_state)
+    printf '  warp_state    : %s\n' "$st"
+    printf '  原始 status   : %s\n' "$(warp_status_raw | tr '\n' ' ' | cut -c1-100)"
+    printf '  配置接入点    : %s\n' "${ENDPOINT:-（自动任播）}"
+    endpoint_show | sed 's/^/  dump          : /'
+
+    printf '\n[3] SOCKS5 出口（127.0.0.1:%s）\n' "$WARP_PROXY_PORT"
+    local tr
+    tr=$(probe_trace 4)
+    if [ -n "$tr" ]; then
+        printf '  可用          : 是  (%s)\n' "$tr"
+    else
+        printf '  可用          : 否（连不上或出不了网）\n'
+    fi
+
+    printf '\n[4] 透明代理规则\n'
+    local n4 nq
+    n4=$(iptables -t nat -S "$CHAIN_NAT" 2>/dev/null | grep -c REDIRECT)
+    nq=$(iptables -t filter -S "$CHAIN_FLT" 2>/dev/null | grep -c REJECT)
+    n4=$((n4 + 0)); nq=$((nq + 0))
+    printf '  Google v4 劫持: %s 条\n' "$n4"
+    printf '  QUIC 阻断     : %s 条\n' "$nq"
+    printf '  IPv6 黑洞     : %s 条\n' "$(ip -6 route show type blackhole 2>/dev/null | grep -c '/')"
+
+    printf '\n[5] 结论\n'
+    if [ "$n4" -gt 0 ] && [ -z "$tr" ]; then
+        warn "劫持规则还在，但 WARP 出不了网 —— 这就是 Google 打不开的直接原因"
+        warn "执行：warp recover"
+    elif [ "$n4" -gt 0 ]; then
+        ok "劫持生效且 WARP 可用，链路正常"
+    else
+        ok "当前没有劫持 Google 流量（走直连，网页能打开）"
+        if [ "$st" != "connected" ]; then
+            warn "WARP 未连接，所以没接管。修好后执行 warp start"
+        fi
+    fi
+    printf '%s\n' "══════════════════════════════════"
+}
+
 # ── 分发 ─────────────────────────────────────────────────────────────
 case "$1" in
+    recover)        cmd_recover ;;
+    doctor)         cmd_doctor ;;
     start)          do_start ;;
     stop)           do_stop ;;
     restart)        do_stop; sleep 1; do_start ;;
@@ -835,7 +1083,7 @@ case "$1" in
     watchdog)       cmd_watchdog ;;
     *)
         cat <<'USAGE_EOF'
-warp-google —— WARP Google 透明代理运行时 (v2.0.0)
+warp-google —— WARP Google 透明代理运行时 (v2.0.1)
 
   start / stop / restart          启停透明代理
   status                          完整状态 + 当前出口 IP / 地区
@@ -848,6 +1096,8 @@ warp-google —— WARP Google 透明代理运行时 (v2.0.0)
                                   手动指定 / 清除接入点
   ipv4   [on|off]                 强制 IPv4 开关
   refresh-google                  从官方 goog.json 刷新 Google 网段
+  recover                         一键恢复（重置接入点 + 重连 + 刷新规则）
+  doctor                          逐层体检，定位到底卡在哪一层
   watchdog                        守护自检（由 systemd timer 调用）
 USAGE_EOF
         ;;
@@ -944,6 +1194,11 @@ BLOCK_GOOGLE_QUIC=1
 PREFER_REGION=""
 # 1 = 出口地区漂移时守护进程自动换回其它可用接入点
 AUTO_REPIN=1
+# 1 = WARP 不通时不劫持 Google 流量（保证网页至少能直连打开）
+#     强烈建议保持 1，否则 WARP 一挂 Google 就会彻底打不开
+REQUIRE_WARP=1
+# 等待 WARP 连上的超时秒数
+CONNECT_TIMEOUT=25
 # 扫描用端口
 SCAN_PORTS="2408"
 # 追加到扫描列表的自定义接入点
@@ -1117,7 +1372,7 @@ INSTALLER=/usr/local/bin/warp-google.sh
 RAW_URL="https://raw.githubusercontent.com/pomelo-neko/warp-google/main/warp-google.sh"
 
 case "$1" in
-    status|start|stop|restart|probe|scan|region|nat64|endpoint|ipv4|watchdog|refresh-google)
+    status|start|stop|restart|probe|scan|region|nat64|endpoint|ipv4|watchdog|refresh-google|recover|doctor)
         [ -x "$ENGINE" ] || { echo "warp-google 未安装，请先执行安装脚本"; exit 1; }
         exec "$ENGINE" "$@"
         ;;
@@ -1167,12 +1422,20 @@ case "$1" in
     warp nat64 list              用第三方 NAT64 网关换落地国家
     warp nat64 set us
 
+  出问题了（Google 打不开时按这个顺序来）
+    warp doctor                  逐层体检，看到底卡在哪一层
+    warp recover                 一键恢复：重置接入点 + 重连 + 刷新规则
+    warp endpoint reset          只重置接入点（回到 Cloudflare 自动任播）
+
   其它
     warp ipv4 on|off             强制 IPv4 开关
     warp refresh-google          更新 Google 网段（官方 goog.json）
     warp start | stop            启停透明代理
     warp uninstall               完整卸载
     warp menu                    打开菜单
+
+  说明：WARP 不通时脚本不会劫持 Google 流量，会保持直连，
+        所以最坏情况也「只是地区不理想」，不会整个打不开。
 
 HELP_EOF
         ;;
@@ -1411,24 +1674,29 @@ show_menu() {
     printf '  %s请选择操作：%s\n' "$BOLD" "$PLAIN"
     printf '\n'
     printf '  %s1.%s  安装 / 重装 WARP + Google 解锁\n' "$GREEN" "$PLAIN"
-    printf '  %s2.%s  扫描接入点，看你的机器能落到哪些地区   %s← 想换地区先做这个%s\n' "$GREEN" "$PLAIN" "$YELLOW" "$PLAIN"
-    printf '  %s3.%s  锁定出口地区 / 手动指定接入点\n' "$GREEN" "$PLAIN"
-    printf '  %s4.%s  强制 IPv4 开关 / NAT64 换落地国家\n' "$GREEN" "$PLAIN"
-    printf '  %s5.%s  查看 IP 信息（直连 / WARP 出口）\n' "$GREEN" "$PLAIN"
-    printf '  %s6.%s  测试 Google / AI Studio 连通性\n' "$GREEN" "$PLAIN"
+    printf '  %s2.%s  查看 IP 信息（直连 / WARP 出口）\n' "$GREEN" "$PLAIN"
+    printf '  %s3.%s  测试 Google / AI Studio 连通性\n' "$GREEN" "$PLAIN"
+    printf '  %s4.%s  扫描接入点，看你的机器能落到哪些地区\n' "$GREEN" "$PLAIN"
+    printf '  %s5.%s  锁定出口地区 / 手动指定接入点\n' "$GREEN" "$PLAIN"
+    printf '  %s6.%s  强制 IPv4 开关 / NAT64 换落地国家\n' "$GREEN" "$PLAIN"
     printf '  %s7.%s  更新 Google 网段（官方 goog.json）\n' "$GREEN" "$PLAIN"
     printf '  %s8.%s  重启透明代理\n' "$GREEN" "$PLAIN"
-    printf '  %s9.%s  完整卸载\n' "$GREEN" "$PLAIN"
+    printf '\n'
+    printf '  %s9.%s  一键恢复（Google 打不开时先选这个） %s←%s\n' "$GREEN" "$PLAIN" "$YELLOW" "$PLAIN"
+    printf '  %s10.%s 逐层体检诊断（看到底卡在哪一层）\n' "$GREEN" "$PLAIN"
+    printf '  %s11.%s 完整卸载\n' "$GREEN" "$PLAIN"
     printf '\n'
     printf '  %s0.%s  退出\n' "$GREEN" "$PLAIN"
     printf '\n'
     hr
-    read -rp "  请输入选项 [0-9]: " choice
+    read -rp "  请输入选项 [0-11]: " choice
     printf '\n'
     case "$choice" in
         1) do_install ;;
-        2) if [ -x "$ENGINE" ]; then "$ENGINE" scan; else warn "请先安装"; fi ;;
-        3)
+        2) show_current_ip; [ -x "$ENGINE" ] && "$ENGINE" probe ;;
+        3) do_test ;;
+        4) if [ -x "$ENGINE" ]; then "$ENGINE" scan; else warn "请先安装"; fi ;;
+        5)
             printf '  1) 锁定地区   2) 手动指定接入点   3) 取消锁定\n'
             read -rp "  选择: " sub
             case "$sub" in
@@ -1437,7 +1705,7 @@ show_menu() {
                 3) [ -x "$ENGINE" ] && "$ENGINE" region off ;;
             esac
             ;;
-        4)
+        6)
             printf '  1) 强制 IPv4 开   2) 强制 IPv4 关   3) NAT64 换落地\n'
             read -rp "  选择: " sub
             case "$sub" in
@@ -1452,16 +1720,16 @@ show_menu() {
                     ;;
             esac
             ;;
-        5) show_current_ip; [ -x "$ENGINE" ] && "$ENGINE" probe ;;
-        6) do_test ;;
         7) [ -x "$ENGINE" ] && "$ENGINE" refresh-google && "$ENGINE" restart ;;
         8) [ -x "$ENGINE" ] && "$ENGINE" restart ;;
-        9)
+        9) if [ -x "$ENGINE" ]; then "$ENGINE" recover; else warn "请先安装"; fi ;;
+        10) if [ -x "$ENGINE" ]; then "$ENGINE" doctor; else warn "请先安装"; fi ;;
+        11)
             read -rp "  确认完整卸载? [y/N]: " cu
             if [[ "$cu" =~ ^[Yy]$ ]]; then do_uninstall; else warn "已取消"; fi
             ;;
         0) printf '%s  再见！%s\n\n' "$GREEN" "$PLAIN"; exit 0 ;;
-        *) error "无效选项，请输入 0-9" ;;
+        *) error "无效选项，请输入 0-11" ;;
     esac
     printf '\n'
     read -n1 -rp "  按任意键继续..." _
@@ -1478,7 +1746,7 @@ case "$1" in
     status)    show_status ;;
     test)      do_test ;;
     menu|"")   show_menu ;;
-    ip|probe|start|stop|restart|scan|region|nat64|endpoint|ipv4|watchdog|refresh-google)
+    ip|probe|start|stop|restart|scan|region|nat64|endpoint|ipv4|watchdog|refresh-google|recover|doctor)
         if [ -x "$ENGINE" ]; then
             exec "$ENGINE" "$@"
         fi

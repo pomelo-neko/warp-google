@@ -7,6 +7,58 @@
 
 ---
 
+## 零、出问题了先看这里（v2.0.1）
+
+### Google 打不开了
+
+按顺序执行，一般就好了：
+
+```bash
+warp doctor     # 逐层体检：组件 / 连接 / SOCKS5 / 规则 / 结论
+warp recover    # 一键恢复：重置接入点 → 重连 → 刷新规则
+```
+
+最省事的做法是先 `warp recover`；如果还不行，把 `warp doctor` 的输出发出来，它会告诉你卡在哪一层。
+
+### 扫描显示「所有接入点都不可用」是怎么回事
+
+有两种完全不同的原因，`warp doctor` 能区分：
+
+1. **你的 VPS 到 WARP 接入点的 UDP 真的不通** —— 这时候接入点切换确实全失败。可以看 `warp doctor` 里 [3] SOCKS5 那一段：如果连**默认任播**都出不去，就是网络层的问题，不是接入点的问题。
+2. **旧版脚本的 bug**（v2.0.0，已修）—— 见下。
+
+### v2.0.1 修了什么
+
+v2.0.0 的 `warp scan` 是**靠反复改写 warp-cli 的接入点**来探测的，它有两个坑，叠在一起就是你遇到的现象：
+
+| 问题 | 后果 |
+|---|---|
+| 扫描结束后**不还原原接入点** | warp-cli 停在最后一个（可能不通的）接入点上，而 iptables 劫持规则还在 → redsocks 把 Google 请求转给一个连不上的 SOCKS5 → **Google 直接打不开，其它网站正常** |
+| 只等 **10 秒**，且把 `unknown` 当失败 | 稍慢的接入点被误判成「不可用」；而 `warp-cli` 有些版本把状态打到 **stderr**，只收 stdout 会得到空串，于是**明明连着也被判成 unknown → 可用接入点全被标成失败** |
+
+v2.0.1 的修法：
+
+- **扫描前保存接入点，用 `trap` 保证无论正常结束、报错还是 Ctrl-C 都会还原**，并在还原后自动重新装回劫持规则
+- 扫描期间**先撤掉劫持规则**：WARP 断了也只是走直连，网页不会卡死
+- 连接等待改为 `wait_connected`：`connecting` / `unknown` 继续等，只有明确失败才提前退出，超时默认 **25 秒**（可配 `CONNECT_TIMEOUT`）
+- 状态读取改成 **stdout + stderr 都收**，并去掉 ANSI 颜色码
+- **换接入点一律「先验证后生效」**：连不上就自动回滚到原值，`endpoint set` / `region set` / `nat64 set` 都走这条路
+
+### 「失败即放行」：最坏情况也不会整个打不开
+
+这是 v2.0.1 最重要的一条设计原则：
+
+> **WARP 不通的时候，脚本绝不劫持 Google 流量。**
+
+因为一旦劫持，redsocks 就会把请求转给一个连不上的 SOCKS5，结果是 Google 彻底打不开；
+而不劫持最多是「走直连、地区不理想」，网页至少能打开。
+
+`warp start` 和守护进程每次都会先确认「WARP 已连接 **且** SOCKS5 真的能出网（实际拉一次 cdn-cgi/trace）」，确认不了就撤掉规则并保持直连。
+
+配置项 `REQUIRE_WARP=1`（默认开启）控制这个行为。**不建议关掉。**
+
+---
+
 ## 一、先回答两个核心问题
 
 ### Q1：换个 IP 之后 WARP 只给堪萨斯和洛杉矶，是跟我的 IP 有关吗？
@@ -52,11 +104,13 @@ WARP 的出口 IP **不是**由你填的接入点（Endpoint）决定的，而�
 逐个试所有 Cloudflare WARP 接入点，把每个接入点实际落地的国家 / colo / 握手耗时 / 出口 IP 列出来：
 
 ```bash
-warp scan            # 8 个常用接入点，约 1~2 分钟
-warp scan --deep     # 17 个接入点 × 4 个端口，约 5~8 分钟
+warp scan            # 8 个常用接入点
+warp scan --deep     # 17 个接入点 × 4 个端口
 warp region list     # 看上次扫到了哪些地区
 warp region set JP   # 锁定到日本（该地区里握手最快的那个接入点）
 ```
+
+> ⚠️ **扫描会短暂影响 Google 访问。** 它需要反复重连接入点，期间脚本会临时撤掉劫持规则（所以网页只是走直连，不会打不开），并在结束时自动还原你原来的接入点。Ctrl-C 中断也会还原。
 
 **要诚实说明：** 因为出口是 Anycast 就近决定的，如果你的 IP 只被牵引到美国，那扫完大概率所有接入点都是 US。这时候 `warp scan` 的价值是**告诉你事实**（而不是让你继续盲目换），并且把可用的接入点按延迟排好，让守护进程能在漂移时自动换回。
 
@@ -157,6 +211,9 @@ warp ipv4 on|off                  强制 IPv4 开关
 warp refresh-google               从官方 goog.json 刷新 Google 网段
 warp start | stop                 启停
 warp uninstall                    完整卸载
+
+warp doctor                       逐层体检，定位到底卡在哪一层
+warp recover                      一键恢复（重置接入点 + 重连 + 刷新规则）
 ```
 
 ### 配置文件 `/etc/warp-google/config`
@@ -168,6 +225,8 @@ BLACKHOLE_GOOGLE_V6=1      # Google IPv6 黑洞
 BLOCK_GOOGLE_QUIC=1        # 阻断 QUIC 绕过
 PREFER_REGION=""           # 期望出口国家码，如 JP
 AUTO_REPIN=1               # 漂移时自动换回
+REQUIRE_WARP=1             # WARP 不通时不劫持，保证网页至少能直连打开（强烈建议保持 1）
+CONNECT_TIMEOUT=25         # 等待 WARP 连上的超时秒数
 SCAN_PORTS="2408"          # 扫描端口
 SCAN_EXTRA=""              # 追加扫描的接入点
 ```
@@ -200,6 +259,14 @@ SCAN_EXTRA=""              # 追加扫描的接入点
 6. **IPv6 黑洞路由不持久** —— 原版只在安装时加一次；重启后由 systemd 服务补，服务挂了就没了。现在守护进程会周期性补回。
 7. **没有重连与自愈** —— 已加守护定时器。
 8. **无法指定接入点 / 地区** —— 已加。
+
+### v2.0.1 追加修复
+
+9. **`warp scan` 结束后不还原接入点** —— 会把 warp-cli 停在最后一个可能不通的接入点上，而劫持规则还在，导致 **Google 完全打不开**。现在用 `trap` 保证无条件还原（含 Ctrl-C）。
+10. **扫描等待太短 + 状态判断不可靠** —— 原来只等 10 秒且把 `unknown` 当失败；有些 `warp-cli` 版本把状态输出到 stderr，只收 stdout 会得到空串，于是**可用接入点全被误判为不可用**。现在 stdout+stderr 都收、去掉 ANSI、超时 25 秒、`connecting/unknown` 继续等。
+11. **WARP 挂了会连带 Google 一起挂** —— 新增「失败即放行」：WARP 不通或 SOCKS5 出不了网时，**不劫持 Google 流量**，保持直连；守护进程也会在检测到不健康时主动撤掉规则。
+12. **换接入点没有回滚** —— 现在 `endpoint set` / `region set` / `nat64 set` 都是「先验证能不能连通、能不能出网，不行就自动回滚到原值」。
+13. **缺少自助排障手段** —— 新增 `warp doctor`（逐层体检）和 `warp recover`（一键恢复）。
 
 ---
 
